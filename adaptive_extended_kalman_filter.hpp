@@ -14,15 +14,15 @@
 
 #pragma once
 
+
 #include <Eigen/Dense>
 #include <algorithm>
 #include <ceres/jet.h>
 #include <functional>
 #include <stdexcept>
 #include <vector>
-#include "../3rdparty/angles.h"
-namespace kalmanLib
-{
+
+namespace kalmanLib {
 /**
  * @brief Adaptive Extended Kalman Filter (AEKF) with residual-based noise estimation.
  *
@@ -48,6 +48,9 @@ public:
     using UpdateQFunc = std::function<MatrixXX()>;
     /// @brief Function type that returns the measurement noise covariance R given a measurement.
     using UpdateRFunc = std::function<MatrixZZ(const MatrixZ1&)>;
+
+    /// @brief Residual function type: residual = f(z_pred, z_meas)
+    using ResidualFunc = std::function<MatrixZ1(const MatrixZ1& z_pred, const MatrixZ1& z_meas)>;
 
     /**
      * @brief Default constructor.
@@ -76,6 +79,10 @@ public:
         P_post(P0) {
         F.setZero();
         H.setZero();
+        // default residual: simple difference z_meas - z_pred
+        residual_func_ = [](const MatrixZ1& z_pred, const MatrixZ1& z_meas) -> MatrixZ1 {
+            return z_meas - z_pred;
+        };
     }
 
     /**
@@ -108,14 +115,6 @@ public:
      */
     void setIterationNum(int num) {
         iteration_num_ = num;
-    }
-
-    /**
-     * @brief Specify which state dimensions represent angles.
-     * @param dims Indices of angle dimensions for wrapping.
-     */
-    void setAngleDims(const std::vector<int>& dims) {
-        angle_dims_ = dims;
     }
 
     /**
@@ -167,6 +166,14 @@ public:
     }
 
     /**
+     * @brief Set a custom residual function. If not set, the default is (z_meas - z_pred).
+     * @param func ResidualFunc taking (z_pred, z_meas) and returning residual vector.
+     */
+    void setResidualFunc(const ResidualFunc& func) {
+        residual_func_ = func;
+    }
+
+    /**
      * @brief Prediction step: propagate state and covariance.
      * @return Predicted state vector x_pri.
      */
@@ -190,7 +197,7 @@ public:
         // Adaptive process noise Q
         if (adaptive_Q_enabled) {
             process_noise_est_ = x_pri - x_post;
-            process_noise_est_.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
+            process_noise_est_ = process_noise_est_.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
             MatrixXX Q_adapt = process_noise_est_ * process_noise_est_.transpose();
             MatrixXX Q_prior = update_Q();
             Q = beta_Q * Q_adapt + (1.0 - beta_Q) * Q_prior;
@@ -233,16 +240,14 @@ public:
                 H.block(i, 0, 1, N_X) = z_p_jet[i].v.transpose();
             }
 
-            // Compute residual and handle angular dimensions
-            MatrixZ1 residual = z - z_pri;
-            for (int idx: angle_dims_) {
-                residual[idx] = angles::shortest_angular_distance(z_pri[idx], z[idx]);
+            // Compute residual using user-supplied residual_func_ (default: z - z_pri)
+            MatrixZ1 residual = residual_func_(z_pri, z);
+
+            // Clamp and sanitize residual (in-place)
+            for (int i = 0; i < N_Z; ++i) {
+                if (!std::isfinite(residual[i])) residual[i] = 0.0;
+                residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
-            residual.unaryExpr([](double v) {
-                if (!std::isfinite(v))
-                    return 0.0;
-                return std::clamp(v, -1e2, 1e2);
-            });
             last_residual_ = residual;
 
             // Adaptive measurement noise R
@@ -261,13 +266,18 @@ public:
             K = P_pri * H.transpose() * S.inverse();
 
             MatrixX1 x_new = x_iter + K * residual;
-            x_new.unaryExpr([&](double v) { return std::isfinite(v) ? v : x_iter; });
+            // sanitize x_new (replace non-finite components with previous)
+            x_new = x_new.unaryExpr([&](double v) { return std::isfinite(v) ? v : 0.0; });
+            for (int i = 0; i < N_X; ++i) {
+                if (!std::isfinite(x_new[i])) x_new[i] = x_iter[i];
+            }
             x_iter = x_new;
         }
 
         // Finalize post-update state and covariance
         x_post = x_iter;
-        x_post.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
+        x_post = x_post.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
+
         P_post = (MatrixXX::Identity() - K * H) * P_pri;
         P_post = 0.5 * (P_post + P_post.transpose());
         return x_post;
@@ -292,7 +302,8 @@ private:
     MatrixZ1 last_residual_ = MatrixZ1::Zero(); ///< Last measurement residual
     MatrixX1 process_noise_est_ = MatrixX1::Zero(); ///< Estimated process noise
 
-    std::vector<int> angle_dims_; ///< Indices of angular state components
+    // angle_dims_ removed per your request
+
     int iteration_num_ = 1; ///< Number of update iterations
     bool adaptive_Q_enabled = false; ///< Enable adaptive Q
     bool adaptive_R_enabled = false; ///< Enable adaptive R
@@ -300,6 +311,9 @@ private:
     double beta_Q = 1.0; ///< Blending factor for Q adaptation
     double beta_R = 1.0; ///< Blending factor for R adaptation
     double small_noise_ = 1e-6; ///< Small noise floor for stability
+
+    // Residual function (default = z_meas - z_pred)
+    ResidualFunc residual_func_;
 };
 
-}
+} // namespace kalmanLib

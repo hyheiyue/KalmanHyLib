@@ -14,23 +14,22 @@
 
 #pragma once
 
+
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <functional>
 #include <vector>
-#include "../3rdparty/angles.h"
 
 namespace kalman_hybird_lib {
-
 
 /**
  * @brief Unscented Kalman Filter (UKF) implementation with optional Gauss-Newton style iterative update.
  * 
  * This UKF uses the Unscented Transform to handle nonlinear process and measurement models.
  * An optional iterative update can refine the posterior state estimate via multiple measurement updates.
- * Supports handling of angular dimensions with shortest angular distance wrap-around.
+ * Supports handling of angular dimensions with user-provided residual function (e.g. shortest angular distance).
  * 
  * @tparam N_X          Dimension of the state vector.
  * @tparam N_Z          Dimension of the measurement vector.
@@ -49,6 +48,9 @@ public:
 
     using UpdateQFunc = std::function<MatrixXX()>;
     using UpdateRFunc = std::function<MatrixZZ(const MatrixZ1&)>;
+
+    /// Residual function type: user provides residual = f(z_pred, z_meas)
+    using ResidualFunc = std::function<MatrixZ1(const MatrixZ1& z_pred, const MatrixZ1& z_meas)>;
 
     /**
      * @brief Construct the Unscented Kalman Filter.
@@ -76,8 +78,7 @@ public:
         h(h),
         update_Q(u_q),
         update_R(u_r),
-        P_post(P0)
-    {
+        P_post(P0) {
         lambda = alpha * alpha * (N_X + kappa) - N_X;
         gamma = std::sqrt(N_X + lambda);
 
@@ -88,6 +89,11 @@ public:
         }
 
         Xsig_pred.setZero();
+
+        // default residual: simple subtraction (z_meas - z_pred)
+        residual_func_ = [](const MatrixZ1& z_pred, const MatrixZ1& z_meas) -> MatrixZ1 {
+            return z_meas - z_pred;
+        };
     }
 
     /**
@@ -99,12 +105,12 @@ public:
     }
 
     /**
-     * @brief Specify which indices in state or measurement vector represent angles.
-     *        Those dimensions will be wrapped via shortest angular distance.
-     * @param dims Vector of angle dimension indices.
+     * @brief Set a custom residual function. If not set, default is (z_meas - z_pred).
+     *        A typical residual for angular dims might compute shortest angular distance.
+     * @param func ResidualFunc taking (z_pred, z_meas) and returning residual vector.
      */
-    void setAngleDims(const std::vector<int>& dims) {
-        angle_dims_ = dims;
+    void setResidualFunc(const ResidualFunc& func) {
+        residual_func_ = func;
     }
 
     /**
@@ -187,33 +193,27 @@ public:
             for (int i = 0; i < 2 * N_X + 1; ++i)
                 z_pred += weights_mean[i] * Zsig.col(i);
 
-            // Calculate innovation covariance matrix S
+            // Calculate innovation covariance matrix S using residual_func_ for measurement differences
             MatrixZZ S = MatrixZZ::Zero();
             for (int i = 0; i < 2 * N_X + 1; ++i) {
-                MatrixZ1 dz = Zsig.col(i) - z_pred;
-                for (int idx : angle_dims_)
-                    dz[idx] = angles::shortest_angular_distance(z_pred[idx], Zsig.col(i)[idx]);
+                MatrixZ1 dz = residual_func_(z_pred, Zsig.col(i));
                 S += weights_cov[i] * dz * dz.transpose();
             }
             S += R;
 
-            // Calculate cross covariance matrix Tc
+            // Calculate cross covariance matrix Tc (state-measurement)
             MatrixXZ Tc = MatrixXZ::Zero();
             for (int i = 0; i < 2 * N_X + 1; ++i) {
                 MatrixX1 dx = Xsig.col(i) - x_iter;
-                MatrixZ1 dz = Zsig.col(i) - z_pred;
-                for (int idx : angle_dims_)
-                    dz[idx] = angles::shortest_angular_distance(z_pred[idx], Zsig.col(i)[idx]);
+                MatrixZ1 dz = residual_func_(z_pred, Zsig.col(i));
                 Tc += weights_cov[i] * dx * dz.transpose();
             }
 
             // Calculate Kalman gain
             MatrixXZ K_iter = Tc * S.inverse();
 
-            // Calculate residual (measurement innovation) with angle wrapping
-            MatrixZ1 residual = z - z_pred;
-            for (int idx : angle_dims_)
-                residual[idx] = angles::shortest_angular_distance(z_pred[idx], z[idx]);
+            // Calculate residual (measurement innovation) using residual_func_
+            MatrixZ1 residual = residual_func_(z_pred, z);
             for (int i = 0; i < N_Z; ++i) {
                 if (!std::isfinite(residual[i]))
                     residual[i] = 0.0;
@@ -233,7 +233,7 @@ public:
         // Save final updated state
         x_post = x_iter;
 
-        // Recompute final Kalman gain and covariance update
+        // Recompute final Kalman gain and covariance update using residual_func_
         generateSigmaPoints(x_post, P_pri, Xsig);
         Eigen::Matrix<double, N_Z, 2 * N_X + 1> Zsig_final;
         for (int i = 0; i < 2 * N_X + 1; ++i)
@@ -245,9 +245,7 @@ public:
 
         MatrixZZ S_final = MatrixZZ::Zero();
         for (int i = 0; i < 2 * N_X + 1; ++i) {
-            MatrixZ1 dz = Zsig_final.col(i) - z_pred_final;
-            for (int idx : angle_dims_)
-                dz[idx] = angles::shortest_angular_distance(z_pred_final[idx], Zsig_final.col(i)[idx]);
+            MatrixZ1 dz = residual_func_(z_pred_final, Zsig_final.col(i));
             S_final += weights_cov[i] * dz * dz.transpose();
         }
         S_final += R;
@@ -255,9 +253,7 @@ public:
         MatrixXZ Tc_final = MatrixXZ::Zero();
         for (int i = 0; i < 2 * N_X + 1; ++i) {
             MatrixX1 dx = Xsig.col(i) - x_post;
-            MatrixZ1 dz = Zsig_final.col(i) - z_pred_final;
-            for (int idx : angle_dims_)
-                dz[idx] = angles::shortest_angular_distance(z_pred_final[idx], Zsig_final.col(i)[idx]);
+            MatrixZ1 dz = residual_func_(z_pred_final, Zsig_final.col(i));
             Tc_final += weights_cov[i] * dx * dz.transpose();
         }
 
@@ -272,33 +268,36 @@ public:
     }
 
 private:
-    PredictFunc f;             ///< Process model function
-    MeasureFunc h;             ///< Measurement model function
-    UpdateQFunc update_Q;      ///< Process noise covariance updater
-    UpdateRFunc update_R;      ///< Measurement noise covariance updater
+    PredictFunc f; ///< Process model function
+    MeasureFunc h; ///< Measurement model function
+    UpdateQFunc update_Q; ///< Process noise covariance updater
+    UpdateRFunc update_R; ///< Measurement noise covariance updater
 
-    double lambda = 0;         ///< UKF scaling parameter lambda
-    double gamma = 0;          ///< Square root of (N_X + lambda)
-    std::array<double, 2 * N_X + 1> weights_mean {};  ///< Sigma point weights for mean
-    std::array<double, 2 * N_X + 1> weights_cov {};   ///< Sigma point weights for covariance
+    double lambda = 0; ///< UKF scaling parameter lambda
+    double gamma = 0; ///< Square root of (N_X + lambda)
+    std::array<double, 2 * N_X + 1> weights_mean {}; ///< Sigma point weights for mean
+    std::array<double, 2 * N_X + 1> weights_cov {}; ///< Sigma point weights for covariance
 
-    Eigen::Matrix<double, N_X, 2 * N_X + 1> Xsig;      ///< Sigma points matrix
+    Eigen::Matrix<double, N_X, 2 * N_X + 1> Xsig; ///< Sigma points matrix
     Eigen::Matrix<double, N_X, 2 * N_X + 1> Xsig_pred; ///< Predicted sigma points matrix
 
-    MatrixXX Q = MatrixXX::Zero();   ///< Process noise covariance
-    MatrixXX P_pri = MatrixXX::Identity();   ///< Prior covariance
-    MatrixXX P_post = MatrixXX::Identity();  ///< Posterior covariance
+    MatrixXX Q = MatrixXX::Zero(); ///< Process noise covariance
+    MatrixXX P_pri = MatrixXX::Identity(); ///< Prior covariance
+    MatrixXX P_post = MatrixXX::Identity(); ///< Posterior covariance
 
-    MatrixZZ R = MatrixZZ::Zero();   ///< Measurement noise covariance
-    MatrixXZ K = MatrixXZ::Zero();   ///< Kalman gain
+    MatrixZZ R = MatrixZZ::Zero(); ///< Measurement noise covariance
+    MatrixXZ K = MatrixXZ::Zero(); ///< Kalman gain
 
-    MatrixX1 x_pri = MatrixX1::Zero();  ///< Predicted (prior) state
+    MatrixX1 x_pri = MatrixX1::Zero(); ///< Predicted (prior) state
     MatrixX1 x_post = MatrixX1::Zero(); ///< Updated (posterior) state
 
-    std::vector<int> angle_dims_;  ///< Indices of angular dimensions to wrap
+    // angle_dims_ removed per request; use residual_func_ to handle wrapping if needed
 
     int iteration_num_ = 1; ///< Number of iterations during update (>=1)
 
+    /// Residual function used to compute measurement differences (default = z_meas - z_pred)
+    ResidualFunc residual_func_;
+    
     /**
      * @brief Generate sigma points from state and covariance.
      * @param x State vector.
