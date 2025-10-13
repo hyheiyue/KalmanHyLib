@@ -228,6 +228,9 @@ public:
         MatrixZZ S_last = MatrixZZ::Zero(); // store last S for NIS
         MatrixZ1 residual_last = MatrixZ1::Zero();
 
+        double prev_res_norm = std::numeric_limits<double>::max();
+        MatrixXZ K_last;
+
         for (int iter = 0; iter < iteration_num_; ++iter) {
             // Inject error into nominal
             MatrixX1 x_full = x_nominal;
@@ -254,38 +257,50 @@ public:
             MatrixZZ S = H * P_iter * H.transpose() + R;
             S += small_noise_ * MatrixZZ::Identity();
             MatrixXZ K = P_iter * H.transpose() * S.inverse();
+            K_last = K;
 
-            // ====== 使用用户定义的残差函数（或默认函数） ======
             MatrixZ1 residual = residual_func_(z_pred, z);
 
-            // 保持原有的 NaN/范围保护和裁剪
             for (int i = 0; i < N_Z; ++i) {
                 if (!std::isfinite(residual[i]))
                     residual[i] = 0.0;
                 residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
 
-            delta_iter += K * residual;
-            P_iter = (MatrixXX::Identity() - K * H) * P_iter;
-            P_iter = 0.5 * (P_iter + P_iter.transpose());
-            last_residual_ = residual;
+            double alpha = 1.0;
+            double cur_res_norm = residual.norm();
+            if (cur_res_norm > prev_res_norm) {
+                alpha = 0.5; // 阻尼
+            }
 
-            // store last S and residual for NIS computation after loop
+            delta_iter += alpha * K * residual;
+
+            double old_res_norm = prev_res_norm;
+            prev_res_norm = cur_res_norm;
+
+            last_residual_ = residual;
             S_last = S;
             residual_last = residual;
+
+            if (cur_res_norm < 1e-4 || std::abs(old_res_norm - cur_res_norm) < 1e-6) {
+                break;
+            }
         }
 
-        // Final injection
+        // ====== 最终注入和协方差更新 (Joseph形式) ======
         if (inject_state)
             inject_state(delta_iter, x_nominal);
         delta_x.setZero();
-        P_delta = P_iter;
+
+        P_delta = (MatrixXX::Identity() - K_last * H) * P_iter
+                * (MatrixXX::Identity() - K_last * H).transpose()
+            + K_last * R * K_last.transpose();
+        P_delta = 0.5 * (P_delta + P_delta.transpose()); // 对称化
 
         // ----------------- Anomaly detection (NIS / NEES) -----------------
         double nis = std::numeric_limits<double>::quiet_NaN();
         double nees = std::numeric_limits<double>::quiet_NaN();
         try {
-            // NIS = residual^T * S^{-1} * residual
             Eigen::VectorXd tmp = S_last.ldlt().solve(residual_last);
             nis = static_cast<double>(residual_last.transpose() * tmp);
         } catch (...) {
@@ -293,7 +308,6 @@ public:
         }
 
         try {
-            // NEES = (x_nominal - x_nominal_pri)^T * P_delta^{-1} * (x_nominal - x_nominal_pri)
             MatrixX1 dx = x_nominal - x_nominal_pri;
             Eigen::VectorXd tmp2 = P_delta.ldlt().solve(dx);
             nees = static_cast<double>(dx.transpose() * tmp2);

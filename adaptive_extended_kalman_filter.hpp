@@ -14,7 +14,6 @@
 
 #pragma once
 
-
 #include <Eigen/Dense>
 #include <algorithm>
 #include <ceres/jet.h>
@@ -197,7 +196,8 @@ public:
         // Adaptive process noise Q
         if (adaptive_Q_enabled) {
             process_noise_est_ = x_pri - x_post;
-            process_noise_est_ = process_noise_est_.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
+            process_noise_est_ =
+                process_noise_est_.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
             MatrixXX Q_adapt = process_noise_est_ * process_noise_est_.transpose();
             MatrixXX Q_prior = update_Q();
             Q = beta_Q * Q_adapt + (1.0 - beta_Q) * Q_prior;
@@ -221,6 +221,8 @@ public:
      */
     MatrixX1 update(const MatrixZ1& z) noexcept {
         MatrixX1 x_iter = x_post;
+        MatrixXZ K_local; // 保存最后一次增益
+        double prev_res_norm = std::numeric_limits<double>::max();
 
         for (int iter = 0; iter < iteration_num_; ++iter) {
             // Auto-differentiate measurement model to compute H jacobian
@@ -243,9 +245,10 @@ public:
             // Compute residual using user-supplied residual_func_ (default: z - z_pri)
             MatrixZ1 residual = residual_func_(z_pri, z);
 
-            // Clamp and sanitize residual (in-place)
+            // Clamp and sanitize residual
             for (int i = 0; i < N_Z; ++i) {
-                if (!std::isfinite(residual[i])) residual[i] = 0.0;
+                if (!std::isfinite(residual[i]))
+                    residual[i] = 0.0;
                 residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
             last_residual_ = residual;
@@ -255,31 +258,53 @@ public:
                 MatrixZZ R_adapt = residual * residual.transpose();
                 MatrixZZ R_prior = update_R(z);
                 R = beta_R * R_adapt + (1.0 - beta_R) * R_prior;
-                R += small_noise_ * MatrixZZ::Identity();
             } else {
                 R = update_R(z);
             }
+            R += small_noise_ * MatrixZZ::Identity();
 
             // Kalman gain and state update
             MatrixZZ S = H * P_pri * H.transpose() + R;
             S += small_noise_ * MatrixZZ::Identity();
-            K = P_pri * H.transpose() * S.inverse();
+            MatrixXZ K = P_pri * H.transpose() * S.inverse();
+            K_local = K; // 保存最后一次增益
 
-            MatrixX1 x_new = x_iter + K * residual;
-            // sanitize x_new (replace non-finite components with previous)
-            x_new = x_new.unaryExpr([&](double v) { return std::isfinite(v) ? v : 0.0; });
-            for (int i = 0; i < N_X; ++i) {
-                if (!std::isfinite(x_new[i])) x_new[i] = x_iter[i];
+            // ====== 自适应步长 / damping ======
+            double alpha = 1.0;
+            double cur_res_norm = residual.norm();
+            if (cur_res_norm > prev_res_norm) {
+                alpha = 0.5; // 阻尼
             }
+
+            // Update estimate
+            MatrixX1 x_new = x_iter + alpha * K * residual;
+            // sanitize x_new
+            for (int i = 0; i < N_X; ++i) {
+                if (!std::isfinite(x_new[i]))
+                    x_new[i] = x_iter[i];
+            }
+
+            // ====== 自适应迭代停止 ======
+            if (cur_res_norm < 1e-4 || std::abs(prev_res_norm - cur_res_norm) < 1e-6)
+                break;
+
             x_iter = x_new;
+            prev_res_norm = cur_res_norm;
         }
 
-        // Finalize post-update state and covariance
+        // Finalize post-update state
         x_post = x_iter;
-        x_post = x_post.unaryExpr([](double v) { return std::isfinite(v) ? v : 0.0; });
+        for (int i = 0; i < N_X; ++i) {
+            if (!std::isfinite(x_post[i]))
+                x_post[i] = 0.0;
+        }
 
-        P_post = (MatrixXX::Identity() - K * H) * P_pri;
+        // Updated covariance using Joseph form
+        P_post = (MatrixXX::Identity() - K_local * H) * P_pri
+                * (MatrixXX::Identity() - K_local * H).transpose()
+            + K_local * R * K_local.transpose();
         P_post = 0.5 * (P_post + P_post.transpose());
+
         return x_post;
     }
 

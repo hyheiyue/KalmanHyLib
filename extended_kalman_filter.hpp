@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include <Eigen/Dense>
 #include <ceres/jet.h>
 #include <cmath>
@@ -207,6 +206,8 @@ public:
         MatrixZZ S; // innovation covariance from last iter
         MatrixXZ K_local; // Kalman gain from last iter
 
+        double prev_res_norm = std::numeric_limits<double>::max();
+
         // Optional iterative refinement
         for (int iter = 0; iter < iteration_num_; ++iter) {
             // Build Ceres Jet for current guess x_iter
@@ -232,12 +233,11 @@ public:
 
             // Innovation covariance S = H P_prior H^T + R
             S = H * P_pri * H.transpose() + R;
-            // Add small term for numerical stability
             S += small_noise_ * MatrixZZ::Identity();
 
             // Compute Kalman gain K = P_prior H^T S^{-1}
-            K = P_pri * H.transpose() * S.inverse();
-            K_local = K; // save
+            MatrixXZ K = P_pri * H.transpose() * S.inverse();
+            K_local = K; // save last K
 
             // Compute residual using user-supplied residual_func_ (default: z - z_pri)
             MatrixZ1 residual = residual_func_(z_pri, z);
@@ -249,15 +249,28 @@ public:
                 residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
 
-            // Update estimate: x_new = x_iter + K * residual
-            MatrixX1 x_new = x_iter + K * residual;
+            // ====== 自适应步长 / damping ======
+            double alpha = 1.0;
+            double cur_res_norm = residual.norm();
+            if (cur_res_norm > prev_res_norm) {
+                alpha = 0.5; // 阻尼
+            }
+
+            // Update estimate
+            MatrixX1 x_new = x_iter + alpha * K * residual;
+
             // Ensure finite
             for (int i = 0; i < N_X; ++i) {
                 if (!std::isfinite(x_new[i]))
                     x_new[i] = x_iter[i];
             }
 
+            // ====== 自适应迭代停止 ======
+            if (cur_res_norm < 1e-4 || std::abs(prev_res_norm - cur_res_norm) < 1e-6)
+                break;
+
             x_iter = x_new;
+            prev_res_norm = cur_res_norm;
             last_residual_ = residual;
         }
 
@@ -268,23 +281,19 @@ public:
                 x_post[i] = 0.0;
         }
 
-        // Updated covariance: P_post = (I - K H) P_prior
-        P_post = (MatrixXX::Identity() - K_local * H) * P_pri;
-        // Symmetrize
-        P_post = 0.5 * (P_post + P_post.transpose());
+        // ====== Updated covariance: Joseph形式 ======
+        P_post = (MatrixXX::Identity() - K_local * H) * P_pri
+                * (MatrixXX::Identity() - K_local * H).transpose()
+            + K_local * R * K_local.transpose();
+        P_post = 0.5 * (P_post + P_post.transpose()); // Symmetrize
 
         // ----------------- Anomaly detection (NIS / NEES) -----------------
-        // residual from last iter is last_residual_ and S from last iter is S
-        // compute NIS using stable solver
         double nis = std::numeric_limits<double>::quiet_NaN();
         double nees = std::numeric_limits<double>::quiet_NaN();
         try {
-            // NIS = residual^T * S^{-1} * residual
-            // use LDLT solve for numerical stability
             Eigen::VectorXd tmp = S.ldlt().solve(last_residual_);
             nis = static_cast<double>(last_residual_.transpose() * tmp);
 
-            // NEES = (x_post - x_pri)^T * P_post^{-1} * (x_post - x_pri)
             MatrixX1 dx = x_post - x_pri;
             Eigen::VectorXd tmp2 = P_post.ldlt().solve(dx);
             nees = static_cast<double>(dx.transpose() * tmp2);
@@ -297,7 +306,6 @@ public:
         last_nees_ = nees;
         total_count_++;
 
-        // evaluate against thresholds if set
         bool nis_failed = false;
         bool nees_failed = false;
         if (nis_threshold_.has_value() && std::isfinite(nis)) {
@@ -311,7 +319,6 @@ public:
                 nees_count_++;
         }
 
-        // push recent nis failure (1/0) into deque for sliding-window rate
         if (std::isfinite(nis)) {
             recent_nis_failures_.push_back(nis_failed ? 1 : 0);
             if (recent_nis_failures_.size() > window_size_) {

@@ -14,7 +14,6 @@
 
 #pragma once
 
-
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
@@ -178,6 +177,7 @@ public:
 
         // Initialize iterative update state with prior mean
         MatrixX1 x_iter = x_pri;
+        double prev_res_norm = std::numeric_limits<double>::max();
 
         for (int iter = 0; iter < iteration_num_; ++iter) {
             // Generate sigma points around current estimate
@@ -188,12 +188,12 @@ public:
             for (int i = 0; i < 2 * N_X + 1; ++i)
                 Zsig.col(i) = h(Xsig.col(i));
 
-            // Calculate predicted measurement mean
+            // Predicted measurement mean
             MatrixZ1 z_pred = MatrixZ1::Zero();
             for (int i = 0; i < 2 * N_X + 1; ++i)
                 z_pred += weights_mean[i] * Zsig.col(i);
 
-            // Calculate innovation covariance matrix S using residual_func_ for measurement differences
+            // Innovation covariance S
             MatrixZZ S = MatrixZZ::Zero();
             for (int i = 0; i < 2 * N_X + 1; ++i) {
                 MatrixZ1 dz = residual_func_(z_pred, Zsig.col(i));
@@ -201,7 +201,7 @@ public:
             }
             S += R;
 
-            // Calculate cross covariance matrix Tc (state-measurement)
+            // Cross covariance Tc
             MatrixXZ Tc = MatrixXZ::Zero();
             for (int i = 0; i < 2 * N_X + 1; ++i) {
                 MatrixX1 dx = Xsig.col(i) - x_iter;
@@ -209,10 +209,10 @@ public:
                 Tc += weights_cov[i] * dx * dz.transpose();
             }
 
-            // Calculate Kalman gain
+            // Kalman gain
             MatrixXZ K_iter = Tc * S.inverse();
 
-            // Calculate residual (measurement innovation) using residual_func_
+            // Residual with damping / clamping
             MatrixZ1 residual = residual_func_(z_pred, z);
             for (int i = 0; i < N_Z; ++i) {
                 if (!std::isfinite(residual[i]))
@@ -220,20 +220,31 @@ public:
                 residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
 
-            // Update state estimate
-            MatrixX1 x_new = x_iter + K_iter * residual;
+            double alpha = 1.0;
+            double cur_res_norm = residual.norm();
+            if (cur_res_norm > prev_res_norm)
+                alpha = 0.5; // simple damping
+
+            // Update state
+            MatrixX1 x_new = x_iter + alpha * K_iter * residual;
             for (int i = 0; i < N_X; ++i) {
                 if (!std::isfinite(x_new[i]))
                     x_new[i] = x_iter[i];
             }
 
+            if (cur_res_norm < 1e-4 || std::abs(prev_res_norm - cur_res_norm) < 1e-6)
+                break;
+
             x_iter = x_new;
+            prev_res_norm = cur_res_norm;
         }
 
-        // Save final updated state
         x_post = x_iter;
+        for (int i = 0; i < N_X; ++i)
+            if (!std::isfinite(x_post[i]))
+                x_post[i] = 0.0;
 
-        // Recompute final Kalman gain and covariance update using residual_func_
+        // Recompute final Kalman gain and covariance
         generateSigmaPoints(x_post, P_pri, Xsig);
         Eigen::Matrix<double, N_Z, 2 * N_X + 1> Zsig_final;
         for (int i = 0; i < 2 * N_X + 1; ++i)
@@ -259,9 +270,8 @@ public:
 
         K = Tc_final * S_final.inverse();
 
-        // Update covariance
-        P_post = P_pri - K * S_final * K.transpose();
-        // Symmetrize covariance matrix
+        // Joseph form covariance update
+        P_post = (MatrixXX::Identity() - K * S_final * K.transpose());
         P_post = 0.5 * (P_post + P_post.transpose());
 
         return x_post;
@@ -297,7 +307,7 @@ private:
 
     /// Residual function used to compute measurement differences (default = z_meas - z_pred)
     ResidualFunc residual_func_;
-    
+
     /**
      * @brief Generate sigma points from state and covariance.
      * @param x State vector.
