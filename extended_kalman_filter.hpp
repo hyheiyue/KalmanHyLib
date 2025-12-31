@@ -54,20 +54,12 @@ public:
         F.setZero(); // Initialize process Jacobian
         H.setZero(); // Initialize measurement Jacobian
 
-        // default values for anomaly detection
-        window_size_ = 50;
-        recent_fail_rate_threshold_ = 0.4;
-        // thresholds not set -> optional empty (user should set proper chi-square thresholds if desired)
-        nis_threshold_.reset();
-        nees_threshold_.reset();
-
         // default residual: simple difference z_meas - z_pred
-        residual_func_ = [](const MatrixZ1& z_pred, const MatrixZ1& z_meas) -> MatrixZ1 {
+        cal_residual = [](const MatrixZ1& z_pred, const MatrixZ1& z_meas) -> MatrixZ1 {
             return z_meas - z_pred;
         };
     }
 
-    // ---- state / model setters ----
     void setState(const MatrixX1& x0) noexcept {
         x_post = x0;
     }
@@ -83,10 +75,8 @@ public:
     void setIterationNum(int num) {
         iteration_num_ = num;
     }
-
-    // new: allow user to set custom residual computation
     void setResidualFunc(const ResidualFunc& func) {
-        residual_func_ = func;
+        cal_residual = func;
     }
 
     const MatrixXX& getPriorCovariance() const noexcept {
@@ -107,62 +97,6 @@ public:
 
     void setUpdateR(const UpdateRFunc& u_r) {
         this->update_R = u_r;
-    }
-
-    // ---- anomaly detection setters/getters ----
-
-    // Set explicit thresholds (e.g. chi-square critical values)
-    void setNisThreshold(double t) {
-        nis_threshold_ = t;
-    }
-    void clearNisThreshold() {
-        nis_threshold_.reset();
-    }
-    void setNeesThreshold(double t) {
-        nees_threshold_ = t;
-    }
-    void clearNeesThreshold() {
-        nees_threshold_.reset();
-    }
-
-    void setWindowSize(size_t w) {
-        window_size_ = w;
-        // trim deque if necessary
-        while (recent_nis_failures_.size() > window_size_)
-            recent_nis_failures_.pop_front();
-    }
-
-    void setRecentFailRateThreshold(double rate) {
-        recent_fail_rate_threshold_ = rate;
-    }
-
-    double lastNis() const noexcept {
-        return last_nis_;
-    }
-    double lastNees() const noexcept {
-        return last_nees_;
-    }
-    int totalChecks() const noexcept {
-        return total_count_;
-    }
-    int nisFailureCount() const noexcept {
-        return nis_count_;
-    }
-    int neesFailureCount() const noexcept {
-        return nees_count_;
-    }
-
-    // recent failure rate in [0,1], returns 0 if no samples
-    double recentNisFailureRate() const noexcept {
-        if (recent_nis_failures_.empty())
-            return 0.0;
-        int sum = std::accumulate(recent_nis_failures_.begin(), recent_nis_failures_.end(), 0);
-        return static_cast<double>(sum) / static_cast<double>(recent_nis_failures_.size());
-    }
-
-    // returns true if recent failure rate exceeds configured threshold
-    bool isRecentlyInconsistent() const noexcept {
-        return recentNisFailureRate() >= recent_fail_rate_threshold_;
     }
 
     // perform the prediction step
@@ -239,17 +173,15 @@ public:
             MatrixXZ K = P_pri * H.transpose() * S.inverse();
             K_local = K; // save last K
 
-            // Compute residual using user-supplied residual_func_ (default: z - z_pri)
-            MatrixZ1 residual = residual_func_(z_pri, z);
+            // Compute residual using user-supplied cal_residual (default: z - z_pri)
+            MatrixZ1 residual = cal_residual(z_pri, z);
 
             // Clamp and sanitize residual
             for (int i = 0; i < N_Z; ++i) {
                 if (!std::isfinite(residual[i]))
                     residual[i] = 0.0;
-                residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
 
-            // ====== 自适应步长 / damping ======
             double alpha = 1.0;
             double cur_res_norm = residual.norm();
             if (cur_res_norm > prev_res_norm) {
@@ -264,8 +196,6 @@ public:
                 if (!std::isfinite(x_new[i]))
                     x_new[i] = x_iter[i];
             }
-
-            // ====== 自适应迭代停止 ======
             if (cur_res_norm < 1e-4 || std::abs(prev_res_norm - cur_res_norm) < 1e-6)
                 break;
 
@@ -281,50 +211,10 @@ public:
                 x_post[i] = 0.0;
         }
 
-        // ====== Updated covariance: Joseph形式 ======
         P_post = (MatrixXX::Identity() - K_local * H) * P_pri
                 * (MatrixXX::Identity() - K_local * H).transpose()
             + K_local * R * K_local.transpose();
         P_post = 0.5 * (P_post + P_post.transpose()); // Symmetrize
-
-        // ----------------- Anomaly detection (NIS / NEES) -----------------
-        double nis = std::numeric_limits<double>::quiet_NaN();
-        double nees = std::numeric_limits<double>::quiet_NaN();
-        try {
-            Eigen::VectorXd tmp = S.ldlt().solve(last_residual_);
-            nis = static_cast<double>(last_residual_.transpose() * tmp);
-
-            MatrixX1 dx = x_post - x_pri;
-            Eigen::VectorXd tmp2 = P_post.ldlt().solve(dx);
-            nees = static_cast<double>(dx.transpose() * tmp2);
-        } catch (...) {
-            nis = std::numeric_limits<double>::quiet_NaN();
-            nees = std::numeric_limits<double>::quiet_NaN();
-        }
-
-        last_nis_ = nis;
-        last_nees_ = nees;
-        total_count_++;
-
-        bool nis_failed = false;
-        bool nees_failed = false;
-        if (nis_threshold_.has_value() && std::isfinite(nis)) {
-            nis_failed = (nis > nis_threshold_.value());
-            if (nis_failed)
-                nis_count_++;
-        }
-        if (nees_threshold_.has_value() && std::isfinite(nees)) {
-            nees_failed = (nees > nees_threshold_.value());
-            if (nees_failed)
-                nees_count_++;
-        }
-
-        if (std::isfinite(nis)) {
-            recent_nis_failures_.push_back(nis_failed ? 1 : 0);
-            if (recent_nis_failures_.size() > window_size_) {
-                recent_nis_failures_.pop_front();
-            }
-        }
 
         return x_post;
     }
@@ -334,7 +224,7 @@ private:
     MeasureFunc h; // Measurement model function
     UpdateQFunc update_Q; // Function to update process noise covariance
     UpdateRFunc update_R; // Function to update measurement noise covariance
-
+    ResidualFunc cal_residual;
     MatrixXX F = MatrixXX::Zero(); // Process Jacobian
     MatrixZX H = MatrixZX::Zero(); // Measurement Jacobian
     MatrixXX Q = MatrixXX::Zero(); // Process noise covariance
@@ -349,28 +239,10 @@ private:
 
     MatrixZ1 last_residual_ = MatrixZ1::Zero();
 
-    // angle_dims_ removed per request
-
     int iteration_num_ = 1; // GN iterations in update
     double small_noise_ = 1e-6;
 
     // residual function (default = z_meas - z_pred)
-    ResidualFunc residual_func_;
-
-    // ----------------- anomaly detection members -----------------
-    size_t window_size_ = 50;
-    std::deque<int> recent_nis_failures_; // holds 0/1 flags (most recent at back)
-    double recent_fail_rate_threshold_ = 0.4; // if recent fail rate >= this -> flagged
-
-    std::optional<double> nis_threshold_; // if has_value -> compare nis > threshold
-    std::optional<double> nees_threshold_; // if has_value -> compare nees > threshold
-
-    int nis_count_ = 0;
-    int nees_count_ = 0;
-    int total_count_ = 0;
-
-    double last_nis_ = std::numeric_limits<double>::quiet_NaN();
-    double last_nees_ = std::numeric_limits<double>::quiet_NaN();
 };
 
 } // namespace kalman_hybird_lib

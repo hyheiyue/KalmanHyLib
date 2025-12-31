@@ -249,7 +249,6 @@ public:
             for (int i = 0; i < N_Z; ++i) {
                 if (!std::isfinite(residual[i]))
                     residual[i] = 0.0;
-                residual[i] = std::clamp(residual[i], -1e2, 1e2);
             }
             last_residual_ = residual;
 
