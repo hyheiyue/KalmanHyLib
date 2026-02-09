@@ -160,6 +160,9 @@ public:
       * @return Updated nominal state.
       */
     MatrixX1 update(const MatrixZ1& z) noexcept {
+        return update(z, h);
+    }
+    MatrixX1 update(const MatrixZ1& z, const MeasureFunc& _h) noexcept {
         MatrixX1 delta_iter = delta_x;
         MatrixXX P_iter = P_delta;
         MatrixZZ S_last = MatrixZZ::Zero(); // store last S for NIS
@@ -182,7 +185,7 @@ public:
                 x_jet[i].v[i] = 1.0;
             }
             ceres::Jet<double, N_X> z_jet[N_Z];
-            h(x_jet, z_jet);
+            _h(x_jet, z_jet);
 
             MatrixZ1 z_pred;
             for (int i = 0; i < N_Z; ++i) {
